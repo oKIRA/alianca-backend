@@ -1,0 +1,104 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum Genero {
+  M
+  F
+}
+
+enum Funcao {
+  ADM
+  PASTOR
+  DISCIPULADOR
+  DISCIPULO
+}
+
+model Usuario {
+  id                    String    @id @default(uuid())
+  nome                  String
+  email                 String    @unique
+  senhaHash             String    @map("senha_hash")
+  telefone              String?
+  dataNascimento        DateTime? @map("data_nascimento")
+  genero                Genero
+  funcao                Funcao    @default(DISCIPULO)
+  supervisorId          String?   @map("supervisor_id")
+  fotoUrl               String?   @map("foto_url")
+  batizado              Boolean   @default(false)
+  universidadeVida      Boolean   @default(false) @map("universidade_vida")
+  capacitacaoDestino1   Boolean   @default(false) @map("capacitacao_destino_1")
+  capacitacaoDestino2   Boolean   @default(false) @map("capacitacao_destino_2")
+  capacitacaoDestino3   Boolean   @default(false) @map("capacitacao_destino_3")
+  nivelAtividade        Int       @default(3) @map("nivel_atividade")
+  ministerioId          String?   @map("ministerio_id")
+  ativo                 Boolean   @default(true)
+  dataCadastro          DateTime  @default(now()) @map("data_cadastro")
+  dataAtualizacao       DateTime  @updatedAt @map("data_atualizacao")
+  
+  // Relações
+  supervisor            Usuario?  @relation("Supervisao", fields: [supervisorId], references: [id], onDelete: SetNull)
+  discipulos            Usuario[] @relation("Supervisao")
+  ministerio            Ministerio? @relation(fields: [ministerioId], references: [id], onDelete: SetNull)
+  estudosCriados        Estudo[]
+  historicoAlteracoes   HistoricoFuncao[] @relation("UsuarioAlterado")
+  alteracoesRealizadas  HistoricoFuncao[] @relation("UsuarioAlterador")
+  
+  @@index([supervisorId])
+  @@index([funcao])
+  @@index([email])
+  @@index([ativo])
+  @@map("usuarios")
+}
+
+model Ministerio {
+  id              String    @id @default(uuid())
+  nome            String    @unique
+  descricao       String?
+  cor             String?
+  icone           String?
+  ativo           Boolean   @default(true)
+  dataCadastro    DateTime  @default(now()) @map("data_cadastro")
+  
+  membros         Usuario[]
+  
+  @@map("ministerios")
+}
+
+model Estudo {
+  id              String    @id @default(uuid())
+  tema            String
+  conteudo        String    @db.Text
+  usuarioId       String    @map("usuario_id")
+  dataCriacao     DateTime  @default(now()) @map("data_criacao")
+  visualizacoes   Int       @default(0)
+  favorito        Boolean   @default(false)
+  
+  criador         Usuario   @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  
+  @@index([usuarioId])
+  @@index([dataCriacao])
+  @@map("estudos")
+}
+
+model HistoricoFuncao {
+  id              String    @id @default(uuid())
+  usuarioId       String    @map("usuario_id")
+  funcaoAnterior  Funcao    @map("funcao_anterior")
+  funcaoNova      Funcao    @map("funcao_nova")
+  alteradoPorId   String    @map("alterado_por_id")
+  dataAlteracao   DateTime  @default(now()) @map("data_alteracao")
+  motivo          String?
+  
+  usuario         Usuario   @relation("UsuarioAlterado", fields: [usuarioId], references: [id], onDelete: Cascade)
+  alteradoPor     Usuario   @relation("UsuarioAlterador", fields: [alteradoPorId], references: [id], onDelete: Cascade)
+  
+  @@index([usuarioId])
+  @@index([dataAlteracao])
+  @@map("historico_funcoes")
+}
