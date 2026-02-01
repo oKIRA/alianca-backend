@@ -6,7 +6,7 @@ dist/
 build/
 
 # Environment
-.env
+.env.exemple
 .env.local
 .env.*.local
 
