@@ -1,17 +1,27 @@
 import { Request, Response, NextFunction } from 'express';
-import { prisma } from '@infrastructure/database/prisma/client';
-import { hashPassword, comparePassword } from '@shared/utils/bcrypt';
+import { db, auth, docToData, FieldValue, Timestamp } from '@infrastructure/database/firebase/client';
 import { AppError } from '@domain/errors/AppError';
 import { AuthRequest } from '../middlewares/authMiddleware';
-import { createUsuarioSchema, updateUsuarioSchema, promoverUsuarioSchema } from '../validators/schemas';
+import {
+  createUsuarioSchema,
+  updateUsuarioSchema,
+  promoverUsuarioSchema,
+} from '../validators/schemas';
+import type {
+  Query,
+  QueryDocumentSnapshot,
+  DocumentSnapshot,
+} from 'firebase-admin/firestore';
+
+type Funcao = 'ADM' | 'PASTOR' | 'DISCIPULADOR' | 'DISCIPULO';
 
 export class UsuarioController {
   async list(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const { userId, userRole } = req as AuthRequest;
-      const { 
-        funcao, 
-        genero, 
+      const {
+        funcao,
+        genero,
         supervisor_id,
         ministerio_id,
         batizado,
@@ -21,59 +31,90 @@ export class UsuarioController {
 
       const pageNum = parseInt(page as string);
       const limitNum = parseInt(limit as string);
-      const skip = (pageNum - 1) * limitNum;
 
-      const where: any = { ativo: true };
-
-      // Filtros de permissão por função
+      // Determinar IDs permitidos por role
+      let allowedIds: string[] | null = null;
       if (userRole === 'PASTOR') {
-        // Pastor vê sua rede
-        const rede = await this.getRedeIds(userId);
-        where.id = { in: rede };
+        allowedIds = await this.getRedeIds(userId);
       } else if (userRole === 'DISCIPULADOR') {
-        // Discipulador vê sua célula
-        const celula = await this.getCelulaIds(userId);
-        where.id = { in: celula };
+        allowedIds = await this.getCelulaIds(userId);
       } else if (userRole === 'DISCIPULO') {
-        // Discípulo vê apenas a si mesmo
-        where.id = userId;
+        allowedIds = [userId];
       }
 
-      // Aplicar filtros da query
-      if (funcao) where.funcao = funcao;
-      if (genero) where.genero = genero;
-      if (supervisor_id) where.supervisorId = supervisor_id;
-      if (ministerio_id) where.ministerioId = ministerio_id;
-      if (batizado !== undefined) where.batizado = batizado === 'true';
+      if (allowedIds !== null && allowedIds.length === 0) {
+        res.json({ data: [], total: 0, page: pageNum, limit: limitNum, totalPages: 0 });
+        return;
+      }
 
-      const [usuarios, total] = await Promise.all([
-        prisma.usuario.findMany({
-          where,
-          include: {
-            supervisor: {
-              select: { id: true, nome: true, funcao: true },
-            },
-            ministerio: true,
-            _count: {
-              select: { discipulos: true },
-            },
-          },
-          orderBy: { nome: 'asc' },
-          skip,
-          take: limitNum,
-        }),
-        prisma.usuario.count({ where }),
+      let pagedDocs: QueryDocumentSnapshot[];
+      let total: number;
+
+      if (allowedIds !== null) {
+        // Non-ADM: buscar por IDs em lotes e filtrar em memória
+        const allDocs = await this.fetchDocsByIds('usuarios', allowedIds);
+
+        const filtered = allDocs.filter((doc) => {
+          const d = doc.data();
+          if (!d.ativo) return false;
+          if (funcao && d.funcao !== funcao) return false;
+          if (genero && d.genero !== genero) return false;
+          if (supervisor_id && d.supervisorId !== supervisor_id) return false;
+          if (ministerio_id && d.ministerioId !== ministerio_id) return false;
+          if (batizado !== undefined && d.batizado !== (batizado === 'true')) return false;
+          return true;
+        });
+
+        filtered.sort((a, b) =>
+          (a.data().nome as string).localeCompare(b.data().nome as string),
+        );
+
+        total = filtered.length;
+        pagedDocs = filtered.slice((pageNum - 1) * limitNum, pageNum * limitNum);
+      } else {
+        // ADM: query direta no Firestore
+        let query: Query = db.collection('usuarios').where('ativo', '==', true);
+        if (funcao) query = query.where('funcao', '==', funcao);
+        if (genero) query = query.where('genero', '==', genero);
+        if (supervisor_id) query = query.where('supervisorId', '==', supervisor_id);
+        if (ministerio_id) query = query.where('ministerioId', '==', ministerio_id);
+        if (batizado !== undefined) query = query.where('batizado', '==', batizado === 'true');
+        query = query.orderBy('nome');
+
+        const countSnap = await query.count().get();
+        total = countSnap.data().count;
+
+        const snap = await query.offset((pageNum - 1) * limitNum).limit(limitNum).get();
+        pagedDocs = snap.docs as QueryDocumentSnapshot[];
+      }
+
+      // Batch-fetch supervisores, ministérios e contagem de discípulos
+      const supervisorIds = [
+        ...new Set(pagedDocs.map((d) => d.data().supervisorId).filter(Boolean) as string[]),
+      ];
+      const ministerioIds = [
+        ...new Set(pagedDocs.map((d) => d.data().ministerioId).filter(Boolean) as string[]),
+      ];
+
+      const [supervisorMap, ministerioMap, discipulosMap] = await Promise.all([
+        this.batchFetchMap('usuarios', supervisorIds),
+        this.batchFetchMap('ministerios', ministerioIds),
+        this.batchCountDiscipulos(pagedDocs.map((d) => d.id)),
       ]);
 
-      const usuariosSemSenha = usuarios.map(({ senhaHash, ...usuario }: any) => usuario);
-
-      res.json({
-        data: usuariosSemSenha,
-        total,
-        page: pageNum,
-        limit: limitNum,
-        totalPages: Math.ceil(total / limitNum),
+      const usuarios = pagedDocs.map((doc) => {
+        const d = doc.data();
+        return {
+          ...docToData(doc),
+          supervisor: d.supervisorId
+            ? this.supervisorBasic(supervisorMap[d.supervisorId])
+            : null,
+          ministerio: d.ministerioId ? ministerioMap[d.ministerioId] ?? null : null,
+          _count: { discipulos: discipulosMap[doc.id] ?? 0 },
+        };
       });
+
+      res.json({ data: usuarios, total, page: pageNum, limit: limitNum, totalPages: Math.ceil(total / limitNum) });
     } catch (error) {
       next(error);
     }
@@ -84,39 +125,43 @@ export class UsuarioController {
       const { id } = req.params;
       const { userId, userRole } = req as AuthRequest;
 
-      const usuario = await prisma.usuario.findUnique({
-        where: { id },
-        include: {
-          supervisor: {
-            select: { id: true, nome: true, funcao: true },
-          },
-          ministerio: true,
-          discipulos: {
-            select: {
-              id: true,
-              nome: true,
-              email: true,
-              funcao: true,
-              fotoUrl: true,
-            },
-            where: { ativo: true },
-          },
-          _count: {
-            select: { discipulos: true },
-          },
-        },
-      });
+      const doc = await db.collection('usuarios').doc(id).get();
 
-      if (!usuario) {
+      if (!doc.exists) {
         throw new AppError('Usuário não encontrado', 404);
       }
 
-      // Verificar permissão
       await this.checkPermission(userId, userRole, id);
 
-      const { senhaHash, ...usuarioSemSenha } = usuario;
+      const d = doc.data()!;
+      const [ministerioDoc, supervisorDoc, discipulosSnap] = await Promise.all([
+        d.ministerioId ? db.collection('ministerios').doc(d.ministerioId).get() : Promise.resolve(null),
+        d.supervisorId ? db.collection('usuarios').doc(d.supervisorId).get() : Promise.resolve(null),
+        db.collection('usuarios').where('supervisorId', '==', id).where('ativo', '==', true)
+          .select('id', 'nome', 'email', 'funcao', 'fotoUrl').get(),
+      ]);
 
-      res.json(usuarioSemSenha);
+      const ministerio = ministerioDoc?.exists ? docToData(ministerioDoc) : null;
+      const supervisorRaw = supervisorDoc?.exists ? supervisorDoc.data() : null;
+      const supervisor = supervisorRaw
+        ? { id: supervisorDoc!.id, nome: supervisorRaw.nome, funcao: supervisorRaw.funcao }
+        : null;
+
+      const discipulos = discipulosSnap.docs.map((disc) => ({
+        id: disc.id,
+        nome: disc.data().nome,
+        email: disc.data().email,
+        funcao: disc.data().funcao,
+        fotoUrl: disc.data().fotoUrl ?? null,
+      }));
+
+      res.json({
+        ...docToData(doc),
+        ministerio,
+        supervisor,
+        discipulos,
+        _count: { discipulos: discipulosSnap.size },
+      });
     } catch (error) {
       next(error);
     }
@@ -127,33 +172,54 @@ export class UsuarioController {
       const { userId, userRole } = req as AuthRequest;
       const data = createUsuarioSchema.parse(req.body);
 
-      // Verificar se pode criar usuário
       if (userRole === 'DISCIPULO') {
         throw new AppError('Você não tem permissão para criar usuários', 403);
       }
 
-      // Hash da senha
-      const senhaHash = await hashPassword(data.senha);
+      // Criar usuário no Firebase Auth
+      let authUser: Awaited<ReturnType<typeof auth.createUser>>;
+      try {
+        authUser = await auth.createUser({
+          email: data.email,
+          password: data.senha,
+          displayName: data.nome,
+        });
+      } catch (err: any) {
+        if (err.code === 'auth/email-already-exists') {
+          throw new AppError('Já existe um usuário com este email', 409);
+        }
+        throw err;
+      }
 
-      const { senha, ...dadosSemSenha } = data;
+      const { senha, ...perfil } = data;
 
-      const usuario = await prisma.usuario.create({
-        data: {
-          ...dadosSemSenha,
-          senhaHash,
-          dataNascimento: data.dataNascimento ? new Date(data.dataNascimento) : null,
-        },
-        include: {
-          supervisor: {
-            select: { id: true, nome: true, funcao: true },
-          },
-          ministerio: true,
-        },
+      // Criar documento no Firestore
+      const novoDoc: Record<string, unknown> = {
+        ...perfil,
+        dataNascimento: data.dataNascimento ? Timestamp.fromDate(new Date(data.dataNascimento)) : null,
+        ativo: true,
+        dataCadastro: FieldValue.serverTimestamp(),
+        dataAtualizacao: FieldValue.serverTimestamp(),
+      };
+
+      await db.collection('usuarios').doc(authUser.uid).set(novoDoc);
+
+      const criado = await db.collection('usuarios').doc(authUser.uid).get();
+      const d = criado.data()!;
+
+      const [supervisorDoc, ministerioDoc] = await Promise.all([
+        d.supervisorId ? db.collection('usuarios').doc(d.supervisorId).get() : Promise.resolve(null),
+        d.ministerioId ? db.collection('ministerios').doc(d.ministerioId).get() : Promise.resolve(null),
+      ]);
+
+      const supervisorRaw = supervisorDoc?.exists ? supervisorDoc.data() : null;
+      res.status(201).json({
+        ...docToData(criado),
+        supervisor: supervisorRaw
+          ? { id: supervisorDoc!.id, nome: supervisorRaw.nome, funcao: supervisorRaw.funcao }
+          : null,
+        ministerio: ministerioDoc?.exists ? docToData(ministerioDoc) : null,
       });
-
-      const { senhaHash: _, ...usuarioSemSenha } = usuario;
-
-      res.status(201).json(usuarioSemSenha);
     } catch (error) {
       next(error);
     }
@@ -165,26 +231,40 @@ export class UsuarioController {
       const { userId, userRole } = req as AuthRequest;
       const data = updateUsuarioSchema.parse(req.body);
 
-      // Verificar permissão
       await this.checkPermission(userId, userRole, id);
 
-      const usuario = await prisma.usuario.update({
-        where: { id },
-        data: {
-          ...data,
-          dataNascimento: data.dataNascimento ? new Date(data.dataNascimento) : undefined,
-        },
-        include: {
-          supervisor: {
-            select: { id: true, nome: true, funcao: true },
-          },
-          ministerio: true,
-        },
+      const updateData: Record<string, unknown> = {
+        ...data,
+        dataAtualizacao: FieldValue.serverTimestamp(),
+      };
+
+      if (data.dataNascimento) {
+        updateData.dataNascimento = Timestamp.fromDate(new Date(data.dataNascimento));
+      }
+
+      // Sincronizar displayName no Firebase Auth se nome mudou
+      if (data.nome) {
+        await auth.updateUser(id, { displayName: data.nome });
+      }
+
+      await db.collection('usuarios').doc(id).update(updateData);
+
+      const atualizado = await db.collection('usuarios').doc(id).get();
+      const d = atualizado.data()!;
+
+      const [supervisorDoc, ministerioDoc] = await Promise.all([
+        d.supervisorId ? db.collection('usuarios').doc(d.supervisorId).get() : Promise.resolve(null),
+        d.ministerioId ? db.collection('ministerios').doc(d.ministerioId).get() : Promise.resolve(null),
+      ]);
+
+      const supervisorRaw = supervisorDoc?.exists ? supervisorDoc.data() : null;
+      res.json({
+        ...docToData(atualizado),
+        supervisor: supervisorRaw
+          ? { id: supervisorDoc!.id, nome: supervisorRaw.nome, funcao: supervisorRaw.funcao }
+          : null,
+        ministerio: ministerioDoc?.exists ? docToData(ministerioDoc) : null,
       });
-
-      const { senhaHash, ...usuarioSemSenha } = usuario;
-
-      res.json(usuarioSemSenha);
     } catch (error) {
       next(error);
     }
@@ -196,52 +276,57 @@ export class UsuarioController {
       const { userId, userRole } = req as AuthRequest;
       const { novaFuncao, motivo } = promoverUsuarioSchema.parse(req.body);
 
-      // Verificar permissão de promoção
-      const permissoes: Record<string, string[]> = {
-        'ADM': ['PASTOR', 'DISCIPULADOR', 'DISCIPULO'],
-        'PASTOR': ['DISCIPULADOR', 'DISCIPULO'],
-        'DISCIPULADOR': ['DISCIPULO'],
+      const permissoes: Record<string, Funcao[]> = {
+        ADM: ['PASTOR', 'DISCIPULADOR', 'DISCIPULO'],
+        PASTOR: ['DISCIPULADOR', 'DISCIPULO'],
+        DISCIPULADOR: ['DISCIPULO'],
       };
 
-      if (!permissoes[userRole]?.includes(novaFuncao)) {
+      if (!permissoes[userRole]?.includes(novaFuncao as Funcao)) {
         throw new AppError('Você não tem permissão para esta promoção', 403);
       }
 
-      // Verificar se está na rede
       await this.checkPermission(userId, userRole, id);
 
-      const usuarioAtual = await prisma.usuario.findUnique({ where: { id } });
-
-      if (!usuarioAtual) {
+      const usuarioSnap = await db.collection('usuarios').doc(id).get();
+      if (!usuarioSnap.exists) {
         throw new AppError('Usuário não encontrado', 404);
       }
 
-      // Criar registro no histórico e atualizar função
-      const [usuario] = await prisma.$transaction([
-        prisma.usuario.update({
-          where: { id },
-          data: { funcao: novaFuncao },
-          include: {
-            supervisor: {
-              select: { id: true, nome: true, funcao: true },
-            },
-            ministerio: true,
-          },
-        }),
-        prisma.historicoFuncao.create({
-          data: {
-            usuarioId: id,
-            funcaoAnterior: usuarioAtual.funcao,
-            funcaoNova: novaFuncao,
-            alteradoPorId: userId,
-            motivo: motivo || `Promovido para ${novaFuncao}`,
-          },
-        }),
+      const funcaoAnterior = usuarioSnap.data()!.funcao as Funcao;
+
+      // Transação Firestore: atualiza funcao + cria histórico
+      await db.runTransaction(async (tx) => {
+        tx.update(db.collection('usuarios').doc(id), {
+          funcao: novaFuncao,
+          dataAtualizacao: FieldValue.serverTimestamp(),
+        });
+        tx.set(db.collection('historicoFuncoes').doc(), {
+          usuarioId: id,
+          funcaoAnterior,
+          funcaoNova: novaFuncao,
+          alteradoPorId: userId,
+          dataAlteracao: FieldValue.serverTimestamp(),
+          motivo: motivo ?? `Promovido para ${novaFuncao}`,
+        });
+      });
+
+      const atualizado = await db.collection('usuarios').doc(id).get();
+      const d = atualizado.data()!;
+
+      const [supervisorDoc, ministerioDoc] = await Promise.all([
+        d.supervisorId ? db.collection('usuarios').doc(d.supervisorId).get() : Promise.resolve(null),
+        d.ministerioId ? db.collection('ministerios').doc(d.ministerioId).get() : Promise.resolve(null),
       ]);
 
-      const { senhaHash, ...usuarioSemSenha } = usuario;
-
-      res.json(usuarioSemSenha);
+      const supervisorRaw = supervisorDoc?.exists ? supervisorDoc.data() : null;
+      res.json({
+        ...docToData(atualizado),
+        supervisor: supervisorRaw
+          ? { id: supervisorDoc!.id, nome: supervisorRaw.nome, funcao: supervisorRaw.funcao }
+          : null,
+        ministerio: ministerioDoc?.exists ? docToData(ministerioDoc) : null,
+      });
     } catch (error) {
       next(error);
     }
@@ -252,14 +337,16 @@ export class UsuarioController {
       const { id } = req.params;
       const { userId, userRole } = req as AuthRequest;
 
-      // Verificar permissão
       await this.checkPermission(userId, userRole, id);
 
-      // Soft delete
-      await prisma.usuario.update({
-        where: { id },
-        data: { ativo: false },
-      });
+      // Soft delete: desativa doc no Firestore e conta no Firebase Auth
+      await Promise.all([
+        db.collection('usuarios').doc(id).update({
+          ativo: false,
+          dataAtualizacao: FieldValue.serverTimestamp(),
+        }),
+        auth.updateUser(id, { disabled: true }),
+      ]);
 
       res.status(204).send();
     } catch (error) {
@@ -273,31 +360,25 @@ export class UsuarioController {
       const { userId, userRole } = req as AuthRequest;
       const { senhaAtual, novaSenha } = req.body;
 
-      // Verificar se é o próprio usuário ou tem permissão
       if (userId !== id && userRole !== 'ADM') {
         throw new AppError('Você não tem permissão para alterar a senha deste usuário', 403);
       }
 
-      const usuario = await prisma.usuario.findUnique({ where: { id } });
-
-      if (!usuario) {
-        throw new AppError('Usuário não encontrado', 404);
-      }
-
-      // Se não for ADM, verificar senha atual
+      // Se for o próprio usuário, valida senha atual via Firebase Auth REST
       if (userId === id) {
-        const senhaValida = await comparePassword(senhaAtual, usuario.senhaHash);
-        if (!senhaValida) {
+        const userDoc = await db.collection('usuarios').doc(id).get();
+        if (!userDoc.exists) throw new AppError('Usuário não encontrado', 404);
+        const email = userDoc.data()!.email as string;
+
+        const { signInWithEmailAndPassword: signIn } = await import('@shared/utils/firebaseAuth');
+        try {
+          await signIn(email, senhaAtual);
+        } catch {
           throw new AppError('Senha atual incorreta', 401);
         }
       }
 
-      const novaSenhaHash = await hashPassword(novaSenha);
-
-      await prisma.usuario.update({
-        where: { id },
-        data: { senhaHash: novaSenhaHash },
-      });
+      await auth.updateUser(id, { password: novaSenha });
 
       res.json({ message: 'Senha atualizada com sucesso' });
     } catch (error) {
@@ -305,38 +386,43 @@ export class UsuarioController {
     }
   }
 
-  // Métodos auxiliares
+  // ─── Auxiliares ────────────────────────────────────────────────────────────
+
+  /** BFS para obter todos os IDs da rede do pastor (recursivo). */
   private async getRedeIds(userId: string): Promise<string[]> {
-    const result = await prisma.$queryRaw<{ id: string }[]>`
-      WITH RECURSIVE rede AS (
-        SELECT id FROM usuarios WHERE id = ${userId}
-        UNION ALL
-        SELECT u.id FROM usuarios u
-        INNER JOIN rede r ON u.supervisor_id = r.id
-        WHERE u.ativo = true
-      )
-      SELECT id FROM rede
-    `;
-    return result.map((r: { id: string }) => r.id);
+    const ids: string[] = [userId];
+    const queue: string[] = [userId];
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      const snap = await db
+        .collection('usuarios')
+        .where('supervisorId', '==', current)
+        .where('ativo', '==', true)
+        .select()
+        .get();
+      for (const doc of snap.docs) {
+        ids.push(doc.id);
+        queue.push(doc.id);
+      }
+    }
+
+    return ids;
   }
 
+  /** Retorna o próprio discipulador + seus discípulos diretos. */
   private async getCelulaIds(userId: string): Promise<string[]> {
-    const discipulos = await prisma.usuario.findMany({
-      where: {
-        OR: [
-          { id: userId },
-          { supervisorId: userId },
-        ],
-        ativo: true,
-      },
-      select: { id: true },
-    });
-    return discipulos.map((d: { id: string }) => d.id);
+    const snap = await db
+      .collection('usuarios')
+      .where('supervisorId', '==', userId)
+      .where('ativo', '==', true)
+      .select()
+      .get();
+    return [userId, ...snap.docs.map((d) => d.id)];
   }
 
   private async checkPermission(userId: string, userRole: string, targetId: string): Promise<void> {
     if (userRole === 'ADM') return;
-
     if (userRole === 'PASTOR') {
       const rede = await this.getRedeIds(userId);
       if (!rede.includes(targetId)) {
@@ -347,10 +433,68 @@ export class UsuarioController {
       if (!celula.includes(targetId)) {
         throw new AppError('Você não tem permissão para acessar este usuário', 403);
       }
-    } else if (userRole === 'DISCIPULO') {
+    } else {
       if (userId !== targetId) {
         throw new AppError('Você não tem permissão para acessar este usuário', 403);
       }
     }
   }
+
+  /** Batch-fetch em lotes de 30 (limite do Firestore). */
+  private async fetchDocsByIds(
+    collection: string,
+    ids: string[],
+  ): Promise<QueryDocumentSnapshot[]> {
+    if (ids.length === 0) return [];
+    const result: QueryDocumentSnapshot[] = [];
+    for (let i = 0; i < ids.length; i += 30) {
+      const batch = ids.slice(i, i + 30);
+      const refs = batch.map((id) => db.collection(collection).doc(id));
+      const snaps = await db.getAll(...refs);
+      result.push(...(snaps.filter((s) => s.exists) as QueryDocumentSnapshot[]));
+    }
+    return result;
+  }
+
+  /** Retorna um mapa id → dados para batch lookups. */
+  private async batchFetchMap(
+    collection: string,
+    ids: string[],
+  ): Promise<Record<string, Record<string, unknown> | null>> {
+    if (ids.length === 0) return {};
+    const docs = await this.fetchDocsByIds(collection, ids);
+    const map: Record<string, Record<string, unknown> | null> = {};
+    docs.forEach((doc) => {
+      map[doc.id] = docToData(doc);
+    });
+    return map;
+  }
+
+  /** Conta discípulos de uma lista de líderes em lote. */
+  private async batchCountDiscipulos(ids: string[]): Promise<Record<string, number>> {
+    if (ids.length === 0) return {};
+    const counts: Record<string, number> = {};
+    ids.forEach((id) => (counts[id] = 0));
+
+    for (let i = 0; i < ids.length; i += 30) {
+      const batch = ids.slice(i, i + 30);
+      const snap = await db
+        .collection('usuarios')
+        .where('supervisorId', 'in', batch)
+        .where('ativo', '==', true)
+        .select('supervisorId')
+        .get();
+      snap.docs.forEach((doc) => {
+        const supId = doc.data().supervisorId as string;
+        if (supId && counts[supId] !== undefined) counts[supId]++;
+      });
+    }
+    return counts;
+  }
+
+  private supervisorBasic(data: Record<string, unknown> | null | undefined) {
+    if (!data) return null;
+    return { id: data.id, nome: data.nome, funcao: data.funcao };
+  }
 }
+

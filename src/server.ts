@@ -4,7 +4,7 @@ import rateLimit from 'express-rate-limit';
 import { env } from '@config/env';
 import { router } from '@infrastructure/http/routes';
 import { errorHandler } from '@infrastructure/http/middlewares/errorHandler';
-import { prisma } from '@infrastructure/database/prisma/client';
+import { db } from '@infrastructure/database/firebase/client';
 
 const app = express();
 
@@ -48,11 +48,11 @@ const PORT = env.PORT;
 
 const server = app.listen(PORT, async () => {
   try {
-    // Testar conexão com banco de dados
-    await prisma.$connect();
-    console.log('✅ Conexão com banco de dados estabelecida');
+    // Testar conectividade com o Firestore
+    await db.collection('_health').limit(1).get();
+    console.log('✅ Conexão com Firebase/Firestore estabelecida');
   } catch (error) {
-    console.error('❌ Erro ao conectar com banco de dados:', error);
+    console.error('❌ Erro ao conectar com Firebase:', error);
     process.exit(1);
   }
 
@@ -66,17 +66,9 @@ const server = app.listen(PORT, async () => {
 const gracefulShutdown = async () => {
   console.log('\\n🛑 Encerrando servidor...');
   
-  server.close(async () => {
+  server.close(() => {
     console.log('✅ Servidor HTTP fechado');
-    
-    try {
-      await prisma.$disconnect();
-      console.log('✅ Conexão com banco de dados encerrada');
-      process.exit(0);
-    } catch (error) {
-      console.error('❌ Erro ao encerrar conexão com banco de dados:', error);
-      process.exit(1);
-    }
+    process.exit(0);
   });
 
   // Força o encerramento após 10 segundos

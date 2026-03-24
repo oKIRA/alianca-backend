@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { verifyToken } from '@shared/utils/jwt';
+import { auth, db } from '@infrastructure/database/firebase/client';
 import { AppError } from '@domain/errors/AppError';
 
 export interface AuthRequest extends Request {
@@ -7,11 +7,11 @@ export interface AuthRequest extends Request {
   userRole: 'ADM' | 'PASTOR' | 'DISCIPULADOR' | 'DISCIPULO';
 }
 
-export const authMiddleware = (
+export const authMiddleware = async (
   req: Request,
   res: Response,
-  next: NextFunction
-): void => {
+  next: NextFunction,
+): Promise<void> => {
   try {
     const authHeader = req.headers.authorization;
 
@@ -25,13 +25,24 @@ export const authMiddleware = (
       throw new AppError('Token mal formatado', 401);
     }
 
-    const decoded = verifyToken(token);
+    const decoded = await auth.verifyIdToken(token);
 
-    (req as AuthRequest).userId = decoded.userId;
-    (req as AuthRequest).userRole = decoded.funcao;
+    // Buscar funcao atual no Firestore (sempre consistente, sem depender de custom claims)
+    const userDoc = await db.collection('usuarios').doc(decoded.uid).get();
+
+    if (!userDoc.exists || !userDoc.data()?.ativo) {
+      throw new AppError('Usuário inativo ou não encontrado', 401);
+    }
+
+    (req as AuthRequest).userId = decoded.uid;
+    (req as AuthRequest).userRole = userDoc.data()!.funcao as AuthRequest['userRole'];
 
     next();
   } catch (error) {
-    next(new AppError('Token inválido ou expirado', 401));
+    if (error instanceof AppError) {
+      next(error);
+    } else {
+      next(new AppError('Token inválido ou expirado', 401));
+    }
   }
 };

@@ -2,10 +2,8 @@ import { Request, Response, NextFunction } from 'express';
 import { AppError } from '@domain/errors/AppError';
 import { ZodError, ZodIssue } from 'zod';
 
-interface PrismaError extends Error {
+interface FirebaseError extends Error {
   code: string;
-  meta?: Record<string, unknown>;
-  clientVersion: string;
 }
 
 export const errorHandler = (
@@ -35,24 +33,23 @@ export const errorHandler = (
     return;
   }
 
-  // Erros do Prisma (usando duck typing)
-  const prismaError = error as PrismaError;
-  if (prismaError.code && prismaError.clientVersion) {
-    if (prismaError.code === 'P2002') {
-      res.status(409).json({
-        status: 'error',
-        message: 'Já existe um registro com esses dados únicos',
-      });
+  // Erros do Firebase Admin
+  const fbError = error as FirebaseError;
+  if (fbError.code && typeof fbError.code === 'string' && fbError.code.startsWith('auth/')) {
+    if (fbError.code === 'auth/email-already-exists') {
+      res.status(409).json({ status: 'error', message: 'Este email já está cadastrado' });
       return;
     }
-
-    if (prismaError.code === 'P2025') {
+    if (fbError.code === 'auth/user-not-found') {
       res.status(404).json({
         status: 'error',
-        message: 'Registro não encontrado',
+        message: 'Usuário não encontrado no sistema de autenticação',
       });
       return;
     }
+    // Fallback genérico para outros erros do Firebase Auth
+    res.status(400).json({ status: 'error', message: fbError.message || 'Erro de autenticação' });
+    return;
   }
 
   console.error('❌ Erro não tratado:', error);
